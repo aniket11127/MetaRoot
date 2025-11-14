@@ -8,10 +8,19 @@ pragma solidity ^0.8.19;
  */
 contract MetaRoot {
     // ------------------------------------------------------------------------
+    // ERRORS (cheaper than string requires)
+    // ------------------------------------------------------------------------
+    error NotOwner();
+    error ZeroAddress();
+    error SameRoot();
+    error ArrayLengthMismatch();
+    error ETHNotAccepted();
+    error InvalidName();
+
+    // ------------------------------------------------------------------------
     // STATE
     // ------------------------------------------------------------------------
-
-    address private _owner;                     // Contract owner
+    address private _owner;                     // Contract owner (mutable)
     bytes32 private _globalRoot;                // Global root (Merkle or metadata root)
     uint256 private _version;                   // Version counter for global updates
     uint256 private immutable _createdAt;       // Contract creation timestamp (immutable)
@@ -25,12 +34,9 @@ contract MetaRoot {
     // ------------------------------------------------------------------------
     // EVENTS
     // ------------------------------------------------------------------------
-
-    /// @notice Emitted when ownership changes
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     /// @notice Emitted when the global root is updated
-    /// @dev index bytes32 roots for easier on-chain filtering
     event GlobalRootUpdated(
         address indexed updater,
         bytes32 indexed oldRoot,
@@ -39,7 +45,7 @@ contract MetaRoot {
         uint256 timestamp
     );
 
-    /// @notice Emitted when a chain root is updated
+    /// @notice Emitted when a chain root is updated (per chain)
     event ChainRootUpdated(
         address indexed updater,
         uint256 indexed chainId,
@@ -48,29 +54,30 @@ contract MetaRoot {
         uint256 timestamp
     );
 
-    /// @notice Emitted when the contract name is changed
+    /// @notice Emitted when the contract display name is changed
     event ContractRenamed(string oldName, string newName);
+
+    /// @notice (Optional) Emitted when batch update completes (helps off-chain indexing)
+    event BatchChainRootsUpdated(address indexed updater, uint256 indexed count, uint256 timestamp);
 
     // ------------------------------------------------------------------------
     // MODIFIERS
     // ------------------------------------------------------------------------
-
     modifier onlyOwner() {
-        require(msg.sender == _owner, "MetaRoot: caller is not the owner");
+        if (msg.sender != _owner) revert NotOwner();
         _;
     }
 
     // ------------------------------------------------------------------------
     // CONSTRUCTOR
     // ------------------------------------------------------------------------
-
     /**
      * @notice Initialize contract with optional name
      * @param name_ Optional contract name
      */
     constructor(string memory name_) {
         _owner = msg.sender;
-        _version = 1;
+        _version = 1; // starts at 1
         _createdAt = block.timestamp;
         _contractName = bytes(name_).length > 0 ? name_ : "MetaRoot";
         emit OwnershipTransferred(address(0), msg.sender);
@@ -81,7 +88,7 @@ contract MetaRoot {
     // ------------------------------------------------------------------------
 
     /// @notice Current owner address
-    function owner() public view returns (address) {
+    function owner() external view returns (address) {
         return _owner;
     }
 
@@ -90,7 +97,7 @@ contract MetaRoot {
      * @param newOwner Address to receive ownership (non-zero)
      */
     function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "MetaRoot: new owner is zero address");
+        if (newOwner == address(0)) revert ZeroAddress();
         address oldOwner = _owner;
         _owner = newOwner;
         emit OwnershipTransferred(oldOwner, newOwner);
@@ -122,10 +129,23 @@ contract MetaRoot {
      */
     function setGlobalRoot(bytes32 newRoot) external onlyOwner {
         bytes32 old = _globalRoot;
-        require(newRoot != old, "MetaRoot: new root equals current root");
+        if (newRoot == old) revert SameRoot();
 
         _globalRoot = newRoot;
-        _version += 1;
+        // bump version after changing root
+        unchecked { _version += 1; }
+        emit GlobalRootUpdated(msg.sender, old, newRoot, _version, block.timestamp);
+    }
+
+    /**
+     * @notice Force update the global root and version even if equal (useful in some rollups)
+     * @param newRoot The new global root value
+     * @dev Use sparingly; will increment version regardless
+     */
+    function forceSetGlobalRoot(bytes32 newRoot) external onlyOwner {
+        bytes32 old = _globalRoot;
+        _globalRoot = newRoot;
+        unchecked { _version += 1; }
         emit GlobalRootUpdated(msg.sender, old, newRoot, _version, block.timestamp);
     }
 
@@ -150,7 +170,7 @@ contract MetaRoot {
      */
     function setChainRoot(uint256 chainId, bytes32 newRoot) external onlyOwner {
         bytes32 old = _chainRoots[chainId];
-        require(newRoot != old, "MetaRoot: new root equals current root");
+        if (newRoot == old) revert SameRoot();
 
         _chainRoots[chainId] = newRoot;
         _chainUpdateTime[chainId] = block.timestamp;
@@ -164,7 +184,8 @@ contract MetaRoot {
      */
     function batchSetChainRoots(uint256[] calldata chainIds, bytes32[] calldata roots) external onlyOwner {
         uint256 len = chainIds.length;
-        require(len == roots.length, "MetaRoot: array length mismatch");
+        if (len != roots.length) revert ArrayLengthMismatch();
+        // cache for slightly cheaper access
         for (uint256 i = 0; i < len; ) {
             uint256 chainId = chainIds[i];
             bytes32 old = _chainRoots[chainId];
@@ -174,8 +195,9 @@ contract MetaRoot {
                 _chainUpdateTime[chainId] = block.timestamp;
                 emit ChainRootUpdated(msg.sender, chainId, old, newRoot, block.timestamp);
             }
-            unchecked { ++i; } // small gas save, safe because loop bound checked
+            unchecked { ++i; }
         }
+        emit BatchChainRootsUpdated(msg.sender, len, block.timestamp);
     }
 
     /**
@@ -188,6 +210,28 @@ contract MetaRoot {
         roots = new bytes32[](len);
         for (uint256 i = 0; i < len; ) {
             roots[i] = _chainRoots[chainIds[i]];
+            unchecked { ++i; }
+        }
+    }
+
+    /**
+     * @notice Return both roots and timestamps for multiple chainIds
+     * @param chainIds Array of chain ids to query
+     * @return roots Array of roots in same order as chainIds
+     * @return times Array of timestamps corresponding to each chainId (0 if never set)
+     */
+    function getChainRootsAndUpdateTimes(uint256[] calldata chainIds)
+        external
+        view
+        returns (bytes32[] memory roots, uint256[] memory times)
+    {
+        uint256 len = chainIds.length;
+        roots = new bytes32[](len);
+        times = new uint256[](len);
+        for (uint256 i = 0; i < len; ) {
+            uint256 id = chainIds[i];
+            roots[i] = _chainRoots[id];
+            times[i] = _chainUpdateTime[id];
             unchecked { ++i; }
         }
     }
@@ -206,7 +250,10 @@ contract MetaRoot {
      * @param newName New display name
      */
     function renameContract(string calldata newName) external onlyOwner {
+        if (bytes(newName).length == 0) revert InvalidName();
         string memory oldName = _contractName;
+        // Avoid emitting event if name is the same
+        if (keccak256(bytes(oldName)) == keccak256(bytes(newName))) revert InvalidName();
         _contractName = newName;
         emit ContractRenamed(oldName, newName);
     }
@@ -215,8 +262,9 @@ contract MetaRoot {
      * @notice Renounce ownership (irreversible)
      */
     function renounceOwnership() external onlyOwner {
-        emit OwnershipTransferred(_owner, address(0));
+        address old = _owner;
         _owner = address(0);
+        emit OwnershipTransferred(old, address(0));
     }
 
     /**
@@ -249,12 +297,11 @@ contract MetaRoot {
     // ------------------------------------------------------------------------
     // FALLBACK / RECEIVE
     // ------------------------------------------------------------------------
-
     receive() external payable {
-        revert("MetaRoot: direct ETH not accepted");
+        revert ETHNotAccepted();
     }
 
     fallback() external payable {
-        revert("MetaRoot: invalid call");
+        revert InvalidName(); // reuse InvalidName as a neutral revert; or define another error if preferred
     }
 }
