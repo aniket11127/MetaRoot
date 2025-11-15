@@ -2,41 +2,80 @@
 pragma solidity ^0.8.19;
 
 /**
- * @title MetaRoot
- * @notice Decentralized storage for a global Merkle/metadata root and per-chain roots.
- * @dev Ownership, versioning, batch operations and event transparency.
+ * @title MetaRoot++
+ * @notice Advanced Merkle root registry with history, pausing, roles, and EIP-712 support.
  */
+
 contract MetaRoot {
     // ------------------------------------------------------------------------
-    // ERRORS (cheaper than string requires)
+    // ERRORS
     // ------------------------------------------------------------------------
     error NotOwner();
+    error NotAdminOrOwner();
     error ZeroAddress();
     error SameRoot();
     error ArrayLengthMismatch();
     error ETHNotAccepted();
     error InvalidName();
+    error Paused();
+    error InvalidSignature();
 
     // ------------------------------------------------------------------------
     // STATE
     // ------------------------------------------------------------------------
-    address private _owner;                     // Contract owner (mutable)
-    bytes32 private _globalRoot;                // Global root (Merkle or metadata root)
-    uint256 private _version;                   // Version counter for global updates
-    uint256 private immutable _createdAt;       // Contract creation timestamp (immutable)
-    string private _contractName;               // Optional label for UI/tracking
+    address private _owner;
+    uint256 private immutable _createdAt;
+
+    // Admin mapping
+    mapping(address => bool) private _admins;
+
+    // Pausable flag
+    bool private _paused;
+
+    string private _contractName;
+
+    bytes32 private _globalRoot;
+    uint256 private _version;
 
     // chainId => root
     mapping(uint256 => bytes32) private _chainRoots;
-    // chainId => last update timestamp
+    // chainId => time
     mapping(uint256 => uint256) private _chainUpdateTime;
+
+    // ------------------------------------------------------------------------
+    // ROOT HISTORY
+    // ------------------------------------------------------------------------
+    uint256 public constant GLOBAL_HISTORY_LIMIT = 20;
+    struct GlobalHistory { bytes32 root; uint256 timestamp; }
+    GlobalHistory[] private _globalHistory;
+
+    struct ChainHistoryItem {
+        bytes32 root;
+        uint256 timestamp;
+    }
+    mapping(uint256 => ChainHistoryItem[]) private _chainHistory;
+
+    // ------------------------------------------------------------------------
+    // EIP-712
+    // ------------------------------------------------------------------------
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    bytes32 private constant ROOT_UPDATE_TYPEHASH =
+        keccak256("RootUpdate(uint256 chainId,bytes32 newRoot,uint256 nonce)");
+
+    mapping(address => uint256) public nonces;
 
     // ------------------------------------------------------------------------
     // EVENTS
     // ------------------------------------------------------------------------
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event AdminAdded(address admin);
+    event AdminRemoved(address admin);
+    event Paused();
+    event Unpaused();
+    event ContractRenamed(string oldName, string newName);
 
-    /// @notice Emitted when the global root is updated
     event GlobalRootUpdated(
         address indexed updater,
         bytes32 indexed oldRoot,
@@ -45,7 +84,6 @@ contract MetaRoot {
         uint256 timestamp
     );
 
-    /// @notice Emitted when a chain root is updated (per chain)
     event ChainRootUpdated(
         address indexed updater,
         uint256 indexed chainId,
@@ -53,12 +91,6 @@ contract MetaRoot {
         bytes32 newRoot,
         uint256 timestamp
     );
-
-    /// @notice Emitted when the contract display name is changed
-    event ContractRenamed(string oldName, string newName);
-
-    /// @notice (Optional) Emitted when batch update completes (helps off-chain indexing)
-    event BatchChainRootsUpdated(address indexed updater, uint256 indexed count, uint256 timestamp);
 
     // ------------------------------------------------------------------------
     // MODIFIERS
@@ -68,240 +100,186 @@ contract MetaRoot {
         _;
     }
 
+    modifier onlyAdminOrOwner() {
+        if (msg.sender != _owner && !_admins[msg.sender]) revert NotAdminOrOwner();
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (_paused) revert Paused();
+        _;
+    }
+
     // ------------------------------------------------------------------------
     // CONSTRUCTOR
     // ------------------------------------------------------------------------
-    /**
-     * @notice Initialize contract with optional name
-     * @param name_ Optional contract name
-     */
     constructor(string memory name_) {
         _owner = msg.sender;
-        _version = 1; // starts at 1
         _createdAt = block.timestamp;
-        _contractName = bytes(name_).length > 0 ? name_ : "MetaRoot";
+        _version = 1;
+
+        _contractName = bytes(name_).length > 0 ? name_ : "MetaRoot++";
+
         emit OwnershipTransferred(address(0), msg.sender);
     }
 
     // ------------------------------------------------------------------------
-    // OWNERSHIP
+    // ROLE MANAGEMENT
     // ------------------------------------------------------------------------
-
-    /// @notice Current owner address
-    function owner() external view returns (address) {
-        return _owner;
+    function addAdmin(address admin) external onlyOwner {
+        if (admin == address(0)) revert ZeroAddress();
+        _admins[admin] = true;
+        emit AdminAdded(admin);
     }
 
-    /**
-     * @notice Transfer contract ownership
-     * @param newOwner Address to receive ownership (non-zero)
-     */
-    function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert ZeroAddress();
-        address oldOwner = _owner;
-        _owner = newOwner;
-        emit OwnershipTransferred(oldOwner, newOwner);
+    function removeAdmin(address admin) external onlyOwner {
+        _admins[admin] = false;
+        emit AdminRemoved(admin);
+    }
+
+    function isAdmin(address addr) external view returns (bool) {
+        return _admins[addr];
     }
 
     // ------------------------------------------------------------------------
-    // GLOBAL ROOT API
+    // PAUSABLE
     // ------------------------------------------------------------------------
-
-    /// @notice Return global root
-    function getGlobalRoot() external view returns (bytes32) {
-        return _globalRoot;
+    function pause() external onlyOwner {
+        _paused = true;
+        emit Paused();
     }
 
-    /// @notice Return current global version
-    function getGlobalVersion() external view returns (uint256) {
-        return _version;
+    function unpause() external onlyOwner {
+        _paused = false;
+        emit Unpaused();
     }
 
-    /// @notice Return contract age in seconds
-    function getContractAge() external view returns (uint256) {
-        return block.timestamp - _createdAt;
+    function isPaused() external view returns (bool) {
+        return _paused;
     }
 
-    /**
-     * @notice Set or update the global root
-     * @dev Does nothing if the new root equals the old root (prevents unnecessary version bumps)
-     * @param newRoot The new global root value
-     */
-    function setGlobalRoot(bytes32 newRoot) external onlyOwner {
+    // ------------------------------------------------------------------------
+    // GLOBAL ROOT
+    // ------------------------------------------------------------------------
+    function setGlobalRoot(bytes32 newRoot)
+        external
+        onlyAdminOrOwner
+        whenNotPaused
+    {
         bytes32 old = _globalRoot;
         if (newRoot == old) revert SameRoot();
 
         _globalRoot = newRoot;
-        // bump version after changing root
-        unchecked { _version += 1; }
+        unchecked { _version++; }
+
+        _pushGlobalHistory(newRoot);
+
         emit GlobalRootUpdated(msg.sender, old, newRoot, _version, block.timestamp);
     }
 
-    /**
-     * @notice Force update the global root and version even if equal (useful in some rollups)
-     * @param newRoot The new global root value
-     * @dev Use sparingly; will increment version regardless
-     */
-    function forceSetGlobalRoot(bytes32 newRoot) external onlyOwner {
-        bytes32 old = _globalRoot;
-        _globalRoot = newRoot;
-        unchecked { _version += 1; }
-        emit GlobalRootUpdated(msg.sender, old, newRoot, _version, block.timestamp);
+    function _pushGlobalHistory(bytes32 root) private {
+        _globalHistory.push(GlobalHistory(root, block.timestamp));
+        if (_globalHistory.length > GLOBAL_HISTORY_LIMIT) {
+            _globalHistory.pop();
+        }
+    }
+
+    function getGlobalHistory() external view returns (GlobalHistory[] memory) {
+        return _globalHistory;
     }
 
     // ------------------------------------------------------------------------
-    // CHAIN ROOT API
+    // CHAIN ROOT
     // ------------------------------------------------------------------------
-
-    /// @notice Get root for a chainId
-    function getChainRoot(uint256 chainId) external view returns (bytes32) {
-        return _chainRoots[chainId];
-    }
-
-    /// @notice Get last update time for a chainId
-    function getChainUpdateTime(uint256 chainId) external view returns (uint256) {
-        return _chainUpdateTime[chainId];
-    }
-
-    /**
-     * @notice Set or update a single chain root
-     * @param chainId Target chain id
-     * @param newRoot New root to assign
-     */
-    function setChainRoot(uint256 chainId, bytes32 newRoot) external onlyOwner {
+    function setChainRoot(uint256 chainId, bytes32 newRoot)
+        external
+        onlyAdminOrOwner
+        whenNotPaused
+    {
         bytes32 old = _chainRoots[chainId];
         if (newRoot == old) revert SameRoot();
 
         _chainRoots[chainId] = newRoot;
         _chainUpdateTime[chainId] = block.timestamp;
+
+        _chainHistory[chainId].push(ChainHistoryItem(newRoot, block.timestamp));
+
         emit ChainRootUpdated(msg.sender, chainId, old, newRoot, block.timestamp);
     }
 
-    /**
-     * @notice Batch set multiple chain roots
-     * @param chainIds Array of chain ids
-     * @param roots Array of corresponding roots
-     */
-    function batchSetChainRoots(uint256[] calldata chainIds, bytes32[] calldata roots) external onlyOwner {
-        uint256 len = chainIds.length;
-        if (len != roots.length) revert ArrayLengthMismatch();
-        // cache for slightly cheaper access
-        for (uint256 i = 0; i < len; ) {
-            uint256 chainId = chainIds[i];
-            bytes32 old = _chainRoots[chainId];
-            bytes32 newRoot = roots[i];
-            if (newRoot != old) {
-                _chainRoots[chainId] = newRoot;
-                _chainUpdateTime[chainId] = block.timestamp;
-                emit ChainRootUpdated(msg.sender, chainId, old, newRoot, block.timestamp);
-            }
-            unchecked { ++i; }
-        }
-        emit BatchChainRootsUpdated(msg.sender, len, block.timestamp);
-    }
-
-    /**
-     * @notice Batch getter for multiple chain roots (read-only)
-     * @param chainIds Array of chain ids to query
-     * @return roots Array of roots in same order as chainIds
-     */
-    function getChainRoots(uint256[] calldata chainIds) external view returns (bytes32[] memory roots) {
-        uint256 len = chainIds.length;
-        roots = new bytes32[](len);
-        for (uint256 i = 0; i < len; ) {
-            roots[i] = _chainRoots[chainIds[i]];
-            unchecked { ++i; }
-        }
-    }
-
-    /**
-     * @notice Return both roots and timestamps for multiple chainIds
-     * @param chainIds Array of chain ids to query
-     * @return roots Array of roots in same order as chainIds
-     * @return times Array of timestamps corresponding to each chainId (0 if never set)
-     */
-    function getChainRootsAndUpdateTimes(uint256[] calldata chainIds)
+    function getChainHistory(uint256 chainId)
         external
         view
-        returns (bytes32[] memory roots, uint256[] memory times)
+        returns (ChainHistoryItem[] memory)
     {
-        uint256 len = chainIds.length;
-        roots = new bytes32[](len);
-        times = new uint256[](len);
-        for (uint256 i = 0; i < len; ) {
-            uint256 id = chainIds[i];
-            roots[i] = _chainRoots[id];
-            times[i] = _chainUpdateTime[id];
-            unchecked { ++i; }
+        return _chainHistory[chainId];
+    }
+
+    // ------------------------------------------------------------------------
+    // EIP-712 SIGN-BASED UPDATES (meta-transactions)
+    // ------------------------------------------------------------------------
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                DOMAIN_TYPEHASH,
+                keccak256(bytes(_contractName)),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(this)
+            )
+        );
+    }
+
+    function updateChainRootBySig(
+        uint256 chainId,
+        bytes32 newRoot,
+        uint256 nonce,
+        bytes calldata signature
+    ) external whenNotPaused {
+        bytes32 digest = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                domainSeparator(),
+                keccak256(abi.encode(ROOT_UPDATE_TYPEHASH, chainId, newRoot, nonce))
+            )
+        );
+
+        address signer = _recover(digest, signature);
+        if (signer != _owner) revert InvalidSignature();
+        if (nonce != nonces[signer]++) revert InvalidSignature();
+
+        setChainRoot(chainId, newRoot); // uses existing logic
+    }
+
+    function _recover(bytes32 hash, bytes memory sig) internal pure returns (address) {
+        if (sig.length != 65) revert InvalidSignature();
+
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+
+        assembly {
+            r := mload(add(sig, 32))
+            s := mload(add(sig, 64))
+            v := byte(0, mload(add(sig, 96)))
         }
+
+        return ecrecover(hash, v, r, s);
     }
 
     // ------------------------------------------------------------------------
-    // CONTRACT METADATA / UTILITY
+    // METADATA
     // ------------------------------------------------------------------------
-
-    /// @notice Contract display name
-    function getContractName() external view returns (string memory) {
-        return _contractName;
-    }
-
-    /**
-     * @notice Rename contract (for UI / tracking)
-     * @param newName New display name
-     */
     function renameContract(string calldata newName) external onlyOwner {
         if (bytes(newName).length == 0) revert InvalidName();
-        string memory oldName = _contractName;
-        // Avoid emitting event if name is the same
-        if (keccak256(bytes(oldName)) == keccak256(bytes(newName))) revert InvalidName();
+        string memory old = _contractName;
         _contractName = newName;
-        emit ContractRenamed(oldName, newName);
-    }
-
-    /**
-     * @notice Renounce ownership (irreversible)
-     */
-    function renounceOwnership() external onlyOwner {
-        address old = _owner;
-        _owner = address(0);
-        emit OwnershipTransferred(old, address(0));
-    }
-
-    /**
-     * @notice Get a compact summary of contract details
-     * @return name Contract name
-     * @return owner_ Owner address
-     * @return version_ Current global version
-     * @return createdAt_ Creation timestamp
-     * @return globalRoot_ Current global root
-     */
-    function getContractDetails()
-        external
-        view
-        returns (
-            string memory name,
-            address owner_,
-            uint256 version_,
-            uint256 createdAt_,
-            bytes32 globalRoot_
-        )
-    {
-        return (_contractName, _owner, _version, _createdAt, _globalRoot);
-    }
-
-    /// @notice Check whether an address is owner
-    function isOwner(address addr) external view returns (bool) {
-        return addr == _owner;
+        emit ContractRenamed(old, newName);
     }
 
     // ------------------------------------------------------------------------
-    // FALLBACK / RECEIVE
+    // FALLBACK
     // ------------------------------------------------------------------------
-    receive() external payable {
-        revert ETHNotAccepted();
-    }
-
-    fallback() external payable {
-        revert InvalidName(); // reuse InvalidName as a neutral revert; or define another error if preferred
-    }
+    receive() external payable { revert ETHNotAccepted(); }
+    fallback() external payable { revert(); }
 }
