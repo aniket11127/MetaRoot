@@ -3,7 +3,7 @@ pragma solidity ^0.8.19;
 
 /**
  * @title MetaRoot++
- * @notice Advanced Merkle root registry with history, pausing, roles, and EIP-712 support.
+ * @notice Advanced Merkle root registry with history, pausing, roles & EIP-712 support.
  */
 
 contract MetaRoot {
@@ -14,7 +14,6 @@ contract MetaRoot {
     error NotAdminOrOwner();
     error ZeroAddress();
     error SameRoot();
-    error ArrayLengthMismatch();
     error ETHNotAccepted();
     error InvalidName();
     error Paused();
@@ -26,10 +25,8 @@ contract MetaRoot {
     address private _owner;
     uint256 private immutable _createdAt;
 
-    // Admin mapping
     mapping(address => bool) private _admins;
 
-    // Pausable flag
     bool private _paused;
 
     string private _contractName;
@@ -37,29 +34,32 @@ contract MetaRoot {
     bytes32 private _globalRoot;
     uint256 private _version;
 
-    // chainId => root
     mapping(uint256 => bytes32) private _chainRoots;
-    // chainId => time
     mapping(uint256 => uint256) private _chainUpdateTime;
 
     // ------------------------------------------------------------------------
     // ROOT HISTORY
     // ------------------------------------------------------------------------
     uint256 public constant GLOBAL_HISTORY_LIMIT = 20;
-    struct GlobalHistory { bytes32 root; uint256 timestamp; }
+
+    struct GlobalHistory {
+        bytes32 root;
+        uint256 timestamp;
+    }
+
     GlobalHistory[] private _globalHistory;
 
     struct ChainHistoryItem {
         bytes32 root;
         uint256 timestamp;
     }
+
     mapping(uint256 => ChainHistoryItem[]) private _chainHistory;
 
     // ------------------------------------------------------------------------
     // EIP-712
     // ------------------------------------------------------------------------
-    bytes32 private constant DOMAIN_TYPEHASH =
-        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private immutable _DOMAIN_SEPARATOR;
 
     bytes32 private constant ROOT_UPDATE_TYPEHASH =
         keccak256("RootUpdate(uint256 chainId,bytes32 newRoot,uint256 nonce)");
@@ -118,9 +118,22 @@ contract MetaRoot {
         _createdAt = block.timestamp;
         _version = 1;
 
-        _contractName = bytes(name_).length > 0 ? name_ : "MetaRoot++";
+        _contractName = bytes(name_).length == 0 ? "MetaRoot++" : name_;
 
         emit OwnershipTransferred(address(0), msg.sender);
+
+        // Pre-calc domain separator once (EIP-712)
+        _DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256(bytes(_contractName)),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(this)
+            )
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -133,7 +146,7 @@ contract MetaRoot {
     }
 
     function removeAdmin(address admin) external onlyOwner {
-        _admins[admin] = false;
+        delete _admins[admin];
         emit AdminRemoved(admin);
     }
 
@@ -170,6 +183,7 @@ contract MetaRoot {
         if (newRoot == old) revert SameRoot();
 
         _globalRoot = newRoot;
+        
         unchecked { _version++; }
 
         _pushGlobalHistory(newRoot);
@@ -178,9 +192,15 @@ contract MetaRoot {
     }
 
     function _pushGlobalHistory(bytes32 root) private {
-        _globalHistory.push(GlobalHistory(root, block.timestamp));
-        if (_globalHistory.length > GLOBAL_HISTORY_LIMIT) {
-            _globalHistory.pop();
+        if (_globalHistory.length == GLOBAL_HISTORY_LIMIT) {
+            // Shift array left — cheaper than removing index 0
+            for (uint256 i; i < GLOBAL_HISTORY_LIMIT - 1; ) {
+                _globalHistory[i] = _globalHistory[i + 1];
+                unchecked { i++; }
+            }
+            _globalHistory[GLOBAL_HISTORY_LIMIT - 1] = GlobalHistory(root, block.timestamp);
+        } else {
+            _globalHistory.push(GlobalHistory(root, block.timestamp));
         }
     }
 
@@ -219,15 +239,7 @@ contract MetaRoot {
     // EIP-712 SIGN-BASED UPDATES (meta-transactions)
     // ------------------------------------------------------------------------
     function domainSeparator() public view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                DOMAIN_TYPEHASH,
-                keccak256(bytes(_contractName)),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(this)
-            )
-        );
+        return _DOMAIN_SEPARATOR;
     }
 
     function updateChainRootBySig(
@@ -239,8 +251,10 @@ contract MetaRoot {
         bytes32 digest = keccak256(
             abi.encodePacked(
                 "\x19\x01",
-                domainSeparator(),
-                keccak256(abi.encode(ROOT_UPDATE_TYPEHASH, chainId, newRoot, nonce))
+                _DOMAIN_SEPARATOR,
+                keccak256(
+                    abi.encode(ROOT_UPDATE_TYPEHASH, chainId, newRoot, nonce)
+                )
             )
         );
 
@@ -248,10 +262,14 @@ contract MetaRoot {
         if (signer != _owner) revert InvalidSignature();
         if (nonce != nonces[signer]++) revert InvalidSignature();
 
-        setChainRoot(chainId, newRoot); // uses existing logic
+        setChainRoot(chainId, newRoot);
     }
 
-    function _recover(bytes32 hash, bytes memory sig) internal pure returns (address) {
+    function _recover(bytes32 hash, bytes memory sig)
+        internal
+        pure
+        returns (address signer)
+    {
         if (sig.length != 65) revert InvalidSignature();
 
         bytes32 r;
@@ -264,7 +282,8 @@ contract MetaRoot {
             v := byte(0, mload(add(sig, 96)))
         }
 
-        return ecrecover(hash, v, r, s);
+        signer = ecrecover(hash, v, r, s);
+        if (signer == address(0)) revert InvalidSignature();
     }
 
     // ------------------------------------------------------------------------
