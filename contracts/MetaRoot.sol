@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
-
+ 
 /**
  * @title MetaRoot++
  * @notice Advanced Merkle root registry with history, pausing, roles & EIP-712 support.
@@ -302,3 +302,4 @@ contract MetaRoot {
     receive() external payable { revert ETHNotAccepted(); }
     fallback() external payable { revert(); }
 }
+
