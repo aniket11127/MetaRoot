@@ -3,8 +3,14 @@ pragma solidity ^0.8.19;
 
 /**
  * @title MetaRoot++
- * @notice Advanced Merkle root registry with history, pausing, roles & EIP-712 meta-updates.
- * @dev Improved for gas efficiency, consistency, ring buffer correctness, and code safety.
+ * @notice Advanced, gas-optimized Merkle root registry with:
+ *         - Global & chain-specific roots
+ *         - History (with ring buffer)
+ *         - Roles (owner/admin)
+ *         - Authorized signers
+ *         - Batch updates
+ *         - EIP-712 signature-based updates
+ *         - Pausing
  */
 contract MetaRoot {
     // ------------------------------------------------------------------------
@@ -22,55 +28,53 @@ contract MetaRoot {
     error ExceedsLimit();
 
     // ------------------------------------------------------------------------
+    // CONSTANTS
+    // ------------------------------------------------------------------------
+    uint256 public constant GLOBAL_HISTORY_LIMIT = 20;
+    uint256 public constant CHAIN_HISTORY_LIMIT = 50;
+
+    bytes32 private constant ROOT_UPDATE_TYPEHASH =
+        keccak256("RootUpdate(uint256 chainId,bytes32 newRoot,uint256 nonce)");
+
+    // ------------------------------------------------------------------------
     // STATE
     // ------------------------------------------------------------------------
     address private _owner;
     uint256 private immutable _createdAt;
 
-    mapping(address => bool) private _admins;
-    address[] private _adminList;
-    mapping(address => uint256) private _adminIndex; // 1-based index
+    string private _contractName;
 
     bool private _paused;
-
-    string private _contractName;
 
     bytes32 private _globalRoot;
     uint256 private _version;
 
+    mapping(address => bool) private _admins;
+    address[] private _adminList;
+    mapping(address => uint256) private _adminIndex; // 1-based index
+
     mapping(uint256 => bytes32) private _chainRoots;
     mapping(uint256 => uint256) private _chainUpdateTime;
 
-    // ------------------------------------------------------------------------
-    // HISTORY
-    // ------------------------------------------------------------------------
-    uint256 public constant GLOBAL_HISTORY_LIMIT = 20;
-    uint256 public constant CHAIN_HISTORY_LIMIT = 50;
-
+    // ---------------- History Storage ----------------
     struct GlobalHistory {
         bytes32 root;
         uint256 timestamp;
     }
-
     GlobalHistory[] private _globalHistory;
 
     struct ChainHistoryItem {
         bytes32 root;
         uint256 timestamp;
     }
-
     mapping(uint256 => mapping(uint256 => ChainHistoryItem)) private _chainHistoryEntries;
     mapping(uint256 => uint256) private _chainHistoryCount;
 
-    // ------------------------------------------------------------------------
-    // EIP-712
-    // ------------------------------------------------------------------------
-    bytes32 private immutable _DOMAIN_SEPARATOR;
-    bytes32 private constant ROOT_UPDATE_TYPEHASH =
-        keccak256("RootUpdate(uint256 chainId,bytes32 newRoot,uint256 nonce)");
-
+    // ---------------- Signature Management ----------------
     mapping(address => uint256) public nonces;
     mapping(address => bool) private _authorizedSigners;
+
+    bytes32 private immutable _DOMAIN_SEPARATOR;
 
     // ------------------------------------------------------------------------
     // EVENTS
@@ -78,8 +82,11 @@ contract MetaRoot {
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
     event AdminAdded(address admin);
     event AdminRemoved(address admin);
+    event AuthorizedSignerAdded(address signer);
+    event AuthorizedSignerRemoved(address signer);
     event Paused();
     event Unpaused();
+
     event ContractRenamed(string oldName, string newName);
 
     event GlobalRootUpdated(
@@ -99,9 +106,6 @@ contract MetaRoot {
     );
 
     event BatchChainRootsUpdated(address indexed updater, uint256 count, uint256 timestamp);
-
-    event AuthorizedSignerAdded(address signer);
-    event AuthorizedSignerRemoved(address signer);
 
     // ------------------------------------------------------------------------
     // MODIFIERS
@@ -268,8 +272,10 @@ contract MetaRoot {
         emit GlobalRootUpdated(msg.sender, old, newRoot, _version, block.timestamp);
     }
 
+    // global history ring buffer (array-shift method)
     function _pushGlobalHistory(bytes32 root) private {
         uint256 len = _globalHistory.length;
+
         if (len == GLOBAL_HISTORY_LIMIT) {
             for (uint256 i = 0; i < len - 1; ) {
                 _globalHistory[i] = _globalHistory[i + 1];
@@ -338,6 +344,7 @@ contract MetaRoot {
     {
         uint256 len = chainIds.length;
         roots = new bytes32[](len);
+
         for (uint256 i = 0; i < len; ) {
             roots[i] = _chainRoots[chainIds[i]];
             unchecked { i++; }
@@ -349,7 +356,9 @@ contract MetaRoot {
         view
         returns (ChainHistoryItem[] memory items)
     {
-        if (maxItems == 0) return new ChainHistoryItem;
+        if (maxItems == 0) {
+            return new ChainHistoryItem;
+        }
         if (maxItems > CHAIN_HISTORY_LIMIT) revert ExceedsLimit();
 
         uint256 total = _chainHistoryCount[chainId];
@@ -364,15 +373,13 @@ contract MetaRoot {
 
         for (uint256 i = 0; i < take; ) {
             items[i] = _chainHistoryEntries[chainId][pos];
-
             pos = (pos == 0) ? CHAIN_HISTORY_LIMIT - 1 : pos - 1;
-
             unchecked { i++; }
         }
     }
 
     // ------------------------------------------------------------------------
-    // SIGNATURE-BASED UPDATES
+    // EIP-712 SIGNATURE-BASED UPDATES
     // ------------------------------------------------------------------------
     function domainSeparator() external view returns (bytes32) {
         return _DOMAIN_SEPARATOR;
@@ -415,10 +422,7 @@ contract MetaRoot {
     {
         if (sig.length != 65) revert InvalidSignature();
 
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-
+        bytes32 r; bytes32 s; uint8 v;
         assembly {
             r := mload(add(sig, 32))
             s := mload(add(sig, 64))
