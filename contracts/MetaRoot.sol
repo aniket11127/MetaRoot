@@ -5,12 +5,19 @@ pragma solidity ^0.8.19;
  * @title MetaRoot++
  * @notice Advanced, gas-optimized Merkle root registry with:
  *         - Global & chain-specific roots
- *         - History (with ring buffer)
+ *         - Bounded history (ring buffers)
  *         - Roles (owner/admin)
  *         - Authorized signers
  *         - Batch updates
  *         - EIP-712 signature-based updates
  *         - Pausing
+ *
+ * Changes in this revision:
+ * - global history uses ring-buffer (O(1) push)
+ * - added many safe public getters
+ * - added renounceOwnership() and owner() getter
+ * - added RootUpdatedBySig event
+ * - fixed array/return constructions & minor defensive checks
  */
 contract MetaRoot {
     // ------------------------------------------------------------------------
@@ -28,7 +35,7 @@ contract MetaRoot {
     error ExceedsLimit();
 
     // ------------------------------------------------------------------------
-    // CONSTANTS
+    // CONSTANTS / TYPEHASH
     // ------------------------------------------------------------------------
     uint256 public constant GLOBAL_HISTORY_LIMIT = 20;
     uint256 public constant CHAIN_HISTORY_LIMIT = 50;
@@ -49,28 +56,27 @@ contract MetaRoot {
     bytes32 private _globalRoot;
     uint256 private _version;
 
+    // admins (mapping + list for enumeration)
     mapping(address => bool) private _admins;
     address[] private _adminList;
     mapping(address => uint256) private _adminIndex; // 1-based index
 
+    // chain roots
     mapping(uint256 => bytes32) private _chainRoots;
     mapping(uint256 => uint256) private _chainUpdateTime;
 
-    // ---------------- History Storage ----------------
-    struct GlobalHistory {
-        bytes32 root;
-        uint256 timestamp;
-    }
-    GlobalHistory[] private _globalHistory;
+    // ---------------- Global history (ring buffer) ----------------
+    struct GlobalHistoryItem { bytes32 root; uint256 timestamp; }
+    mapping(uint256 => GlobalHistoryItem) private _globalHistoryEntries; // index => item
+    uint256 private _globalHistoryCount; // monotonic counter
+    // Note: actual stored entries are at index = (count-1) % GLOBAL_HISTORY_LIMIT
 
-    struct ChainHistoryItem {
-        bytes32 root;
-        uint256 timestamp;
-    }
-    mapping(uint256 => mapping(uint256 => ChainHistoryItem)) private _chainHistoryEntries;
-    mapping(uint256 => uint256) private _chainHistoryCount;
+    // ---------------- Chain history (ring buffers) ----------------
+    struct ChainHistoryItem { bytes32 root; uint256 timestamp; }
+    mapping(uint256 => mapping(uint256 => ChainHistoryItem)) private _chainHistoryEntries; // chainId => pos => item
+    mapping(uint256 => uint256) private _chainHistoryCount; // chainId => count
 
-    // ---------------- Signature Management ----------------
+    // ---------------- Signature management ----------------
     mapping(address => uint256) public nonces;
     mapping(address => bool) private _authorizedSigners;
 
@@ -80,10 +86,14 @@ contract MetaRoot {
     // EVENTS
     // ------------------------------------------------------------------------
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
-    event AdminAdded(address admin);
-    event AdminRemoved(address admin);
-    event AuthorizedSignerAdded(address signer);
-    event AuthorizedSignerRemoved(address signer);
+    event RenouncedOwnership(address indexed previousOwner);
+
+    event AdminAdded(address indexed admin);
+    event AdminRemoved(address indexed admin);
+
+    event AuthorizedSignerAdded(address indexed signer);
+    event AuthorizedSignerRemoved(address indexed signer);
+
     event Paused();
     event Unpaused();
 
@@ -106,6 +116,8 @@ contract MetaRoot {
     );
 
     event BatchChainRootsUpdated(address indexed updater, uint256 count, uint256 timestamp);
+
+    event RootUpdatedBySig(address indexed signer, uint256 indexed chainId, bytes32 newRoot, uint256 nonce, uint256 timestamp);
 
     // ------------------------------------------------------------------------
     // MODIFIERS
@@ -132,16 +144,13 @@ contract MetaRoot {
         _owner = msg.sender;
         _createdAt = block.timestamp;
         _version = 1;
-
         _contractName = bytes(name_).length == 0 ? "MetaRoot++" : name_;
 
         emit OwnershipTransferred(address(0), msg.sender);
 
         _DOMAIN_SEPARATOR = keccak256(
             abi.encode(
-                keccak256(
-                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-                ),
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256(bytes(_contractName)),
                 keccak256(bytes("1")),
                 block.chainid,
@@ -151,14 +160,29 @@ contract MetaRoot {
     }
 
     // ------------------------------------------------------------------------
-    // OWNERSHIP
+    // OWNER / METADATA
     // ------------------------------------------------------------------------
+    /// @notice Returns contract owner
+    function owner() external view returns (address) {
+        return _owner;
+    }
+
+    /// @notice Transfer ownership (owner only)
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         emit OwnershipTransferred(_owner, newOwner);
         _owner = newOwner;
     }
 
+    /// @notice Renounce ownership irreversibly
+    function renounceOwnership() external onlyOwner {
+        address old = _owner;
+        _owner = address(0);
+        emit RenouncedOwnership(old);
+        emit OwnershipTransferred(old, address(0));
+    }
+
+    /// @notice Get basic contract details
     function getContractDetails()
         external
         view
@@ -173,6 +197,11 @@ contract MetaRoot {
         return (_contractName, _owner, _version, _createdAt, _globalRoot);
     }
 
+    /// @notice Get contract display name
+    function getContractName() external view returns (string memory) {
+        return _contractName;
+    }
+
     // ------------------------------------------------------------------------
     // ADMIN MANAGEMENT
     // ------------------------------------------------------------------------
@@ -181,22 +210,20 @@ contract MetaRoot {
         if (!_admins[admin]) {
             _admins[admin] = true;
             _adminList.push(admin);
-            _adminIndex[admin] = _adminList.length;
+            _adminIndex[admin] = _adminList.length; // 1-based
             emit AdminAdded(admin);
         }
     }
 
     function removeAdmin(address admin) external onlyOwner {
         if (!_admins[admin]) return;
-
         uint256 idx = _adminIndex[admin];
-        uint256 lastIdx = _adminList.length;
+        uint256 last = _adminList.length;
+        address lastAddr = _adminList[last - 1];
 
-        address last = _adminList[lastIdx - 1];
-
-        if (idx != lastIdx) {
-            _adminList[idx - 1] = last;
-            _adminIndex[last] = idx;
+        if (idx != last) {
+            _adminList[idx - 1] = lastAddr;
+            _adminIndex[lastAddr] = idx;
         }
 
         _adminList.pop();
@@ -210,8 +237,12 @@ contract MetaRoot {
         return _adminList;
     }
 
-    function isAdmin(address addr) external view returns (bool) {
-        return _admins[addr];
+    function adminCount() external view returns (uint256) {
+        return _adminList.length;
+    }
+
+    function isAdmin(address who) external view returns (bool) {
+        return _admins[who];
     }
 
     // ------------------------------------------------------------------------
@@ -254,78 +285,80 @@ contract MetaRoot {
     }
 
     // ------------------------------------------------------------------------
-    // GLOBAL ROOT
+    // GLOBAL ROOT + HISTORY (ring buffer)
     // ------------------------------------------------------------------------
-    function setGlobalRoot(bytes32 newRoot)
-        public
-        onlyAdminOrOwner
-        whenNotPaused
-    {
+    /// @notice Returns current global root
+    function getGlobalRoot() external view returns (bytes32) {
+        return _globalRoot;
+    }
+
+    /// @notice Returns current global version
+    function getGlobalVersion() external view returns (uint256) {
+        return _version;
+    }
+
+    function setGlobalRoot(bytes32 newRoot) public onlyAdminOrOwner whenNotPaused {
         bytes32 old = _globalRoot;
         if (newRoot == old) revert SameRoot();
 
         _globalRoot = newRoot;
         unchecked { _version++; }
 
-        _pushGlobalHistory(newRoot);
+        // push into ring buffer
+        uint256 cnt = ++_globalHistoryCount;
+        uint256 pos = (cnt - 1) % GLOBAL_HISTORY_LIMIT;
+        _globalHistoryEntries[pos] = GlobalHistoryItem({root: newRoot, timestamp: block.timestamp});
 
         emit GlobalRootUpdated(msg.sender, old, newRoot, _version, block.timestamp);
     }
 
-    // global history ring buffer (array-shift method)
-    function _pushGlobalHistory(bytes32 root) private {
-        uint256 len = _globalHistory.length;
+    /// @notice Get last up to N global history items (newest-first)
+    function getGlobalHistoryLast(uint256 maxItems) external view returns (GlobalHistoryItem[] memory items) {
+        if (maxItems == 0) return new GlobalHistoryItem;
+        if (maxItems > GLOBAL_HISTORY_LIMIT) revert ExceedsLimit();
 
-        if (len == GLOBAL_HISTORY_LIMIT) {
-            for (uint256 i = 0; i < len - 1; ) {
-                _globalHistory[i] = _globalHistory[i + 1];
-                unchecked { i++; }
-            }
-            _globalHistory[len - 1] = GlobalHistory(root, block.timestamp);
-        } else {
-            _globalHistory.push(GlobalHistory(root, block.timestamp));
+        uint256 total = _globalHistoryCount;
+        uint256 available = total > GLOBAL_HISTORY_LIMIT ? GLOBAL_HISTORY_LIMIT : total;
+        uint256 take = maxItems < available ? maxItems : available;
+        items = new GlobalHistoryItem[](take);
+        if (take == 0) return items;
+
+        uint256 pos = (total - 1) % GLOBAL_HISTORY_LIMIT;
+        for (uint256 i = 0; i < take; ) {
+            items[i] = _globalHistoryEntries[pos];
+            pos = (pos == 0) ? GLOBAL_HISTORY_LIMIT - 1 : pos - 1;
+            unchecked { i++; }
         }
     }
 
-    function getGlobalHistory() external view returns (GlobalHistory[] memory) {
-        return _globalHistory;
+    function globalHistoryCount() external view returns (uint256) {
+        return _globalHistoryCount;
     }
 
     // ------------------------------------------------------------------------
-    // CHAIN ROOTS + HISTORY (RING BUFFER)
+    // CHAIN ROOTS + HISTORY (ring buffers)
     // ------------------------------------------------------------------------
-    function setChainRoot(uint256 chainId, bytes32 newRoot)
-        public
-        onlyAdminOrOwner
-        whenNotPaused
-    {
+    function setChainRoot(uint256 chainId, bytes32 newRoot) public onlyAdminOrOwner whenNotPaused {
         bytes32 old = _chainRoots[chainId];
         if (newRoot == old) revert SameRoot();
 
         _chainRoots[chainId] = newRoot;
         _chainUpdateTime[chainId] = block.timestamp;
 
-        uint256 count = ++_chainHistoryCount[chainId];
-        uint256 pos = (count - 1) % CHAIN_HISTORY_LIMIT;
-
-        _chainHistoryEntries[chainId][pos] = ChainHistoryItem(newRoot, block.timestamp);
+        uint256 cnt = ++_chainHistoryCount[chainId];
+        uint256 pos = (cnt - 1) % CHAIN_HISTORY_LIMIT;
+        _chainHistoryEntries[chainId][pos] = ChainHistoryItem({root: newRoot, timestamp: block.timestamp});
 
         emit ChainRootUpdated(msg.sender, chainId, old, newRoot, block.timestamp);
     }
 
-    function batchSetChainRoots(uint256[] calldata chainIds, bytes32[] calldata roots)
-        external
-        onlyAdminOrOwner
-        whenNotPaused
-    {
+    function batchSetChainRoots(uint256[] calldata chainIds, bytes32[] calldata roots) external onlyAdminOrOwner whenNotPaused {
         uint256 len = chainIds.length;
         if (len != roots.length) revert ArrayLengthMismatch();
-
         for (uint256 i = 0; i < len; ) {
             setChainRoot(chainIds[i], roots[i]);
             unchecked { i++; }
         }
-
         emit BatchChainRootsUpdated(msg.sender, len, block.timestamp);
     }
 
@@ -337,45 +370,36 @@ contract MetaRoot {
         return _chainUpdateTime[chainId];
     }
 
-    function getChainRoots(uint256[] calldata chainIds)
-        external
-        view
-        returns (bytes32[] memory roots)
-    {
+    function getChainRoots(uint256[] calldata chainIds) external view returns (bytes32[] memory roots) {
         uint256 len = chainIds.length;
         roots = new bytes32[](len);
-
         for (uint256 i = 0; i < len; ) {
             roots[i] = _chainRoots[chainIds[i]];
             unchecked { i++; }
         }
     }
 
-    function getChainHistoryLast(uint256 chainId, uint256 maxItems)
-        external
-        view
-        returns (ChainHistoryItem[] memory items)
-    {
-        if (maxItems == 0) {
-            return new ChainHistoryItem;
-        }
+    /// @notice Return last up to `maxItems` chain history entries (newest-first)
+    function getChainHistoryLast(uint256 chainId, uint256 maxItems) external view returns (ChainHistoryItem[] memory items) {
+        if (maxItems == 0) return new ChainHistoryItem;
         if (maxItems > CHAIN_HISTORY_LIMIT) revert ExceedsLimit();
 
         uint256 total = _chainHistoryCount[chainId];
         uint256 available = total > CHAIN_HISTORY_LIMIT ? CHAIN_HISTORY_LIMIT : total;
-
         uint256 take = maxItems < available ? maxItems : available;
         items = new ChainHistoryItem[](take);
-
         if (take == 0) return items;
 
         uint256 pos = (total - 1) % CHAIN_HISTORY_LIMIT;
-
         for (uint256 i = 0; i < take; ) {
             items[i] = _chainHistoryEntries[chainId][pos];
             pos = (pos == 0) ? CHAIN_HISTORY_LIMIT - 1 : pos - 1;
             unchecked { i++; }
         }
+    }
+
+    function chainHistoryCount(uint256 chainId) external view returns (uint256) {
+        return _chainHistoryCount[chainId];
     }
 
     // ------------------------------------------------------------------------
@@ -400,35 +424,27 @@ contract MetaRoot {
         );
 
         address signer = _recover(digest, signature);
-
         if (signer != _owner && !_authorizedSigners[signer]) revert InvalidSignature();
         if (nonce != nonces[signer]++) revert InvalidSignature();
 
+        // call underlying setter (will emit ChainRootUpdated)
         setChainRoot(chainId, newRoot);
+
+        emit RootUpdatedBySig(signer, chainId, newRoot, nonce, block.timestamp);
     }
 
-    function verifySigner(bytes32 digest, bytes calldata signature)
-        external
-        pure
-        returns (address)
-    {
+    function verifySigner(bytes32 digest, bytes calldata signature) external pure returns (address) {
         return _recover(digest, signature);
     }
 
-    function _recover(bytes32 hash, bytes memory sig)
-        internal
-        pure
-        returns (address signer)
-    {
+    function _recover(bytes32 hash, bytes memory sig) internal pure returns (address signer) {
         if (sig.length != 65) revert InvalidSignature();
-
         bytes32 r; bytes32 s; uint8 v;
         assembly {
             r := mload(add(sig, 32))
             s := mload(add(sig, 64))
             v := byte(0, mload(add(sig, 96)))
         }
-
         signer = ecrecover(hash, v, r, s);
         if (signer == address(0)) revert InvalidSignature();
     }
@@ -446,11 +462,6 @@ contract MetaRoot {
     // ------------------------------------------------------------------------
     // FALLBACK
     // ------------------------------------------------------------------------
-    receive() external payable {
-        revert ETHNotAccepted();
-    }
-
-    fallback() external payable {
-        revert();
-    }
+    receive() external payable { revert ETHNotAccepted(); }
+    fallback() external payable { revert(); }
 }
